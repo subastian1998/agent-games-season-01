@@ -1,0 +1,12 @@
+# Secrets and local state — never commit.
+.env
+kurier-vk.json
+*.log
+
+# Dependencies (installed via shared/npm/install.js — npm is broken in this VM).
+node_modules/
+tunnel/node_modules/
+shared/npm/node_modules/
+
+# OS / editor noise.
+.DS_Store
