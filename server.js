@@ -39,6 +39,7 @@ const { proveTurn, strategyCommitment } = require('./steal/prove');
 const { toHexString } = require('./shared/field');
 
 const PORT = Number(process.env.PORT || 8080);
+const HOST = process.env.HOST || '0.0.0.0';
 const HMAC_SECRET = process.env.AGENT_GAMES_HMAC_SECRET || '';
 const HMAC_FORMAT = process.env.AGENT_GAMES_HMAC_FORMAT || 'hex'; // or 'sha256='
 const KURIER_API_KEY = process.env.KURIER_API_KEY || '';
@@ -279,8 +280,8 @@ const server = http.createServer(async (req, res) => {
   }
 });
 
-server.listen(PORT, '127.0.0.1', async () => {
-  console.log(`[server] listening on 127.0.0.1:${PORT}  (gatekeeper: /gatekeeper, steal: /steal)`);
+server.listen(PORT, HOST, async () => {
+  console.log(`[server] listening on ${HOST}:${PORT}  (gatekeeper: /gatekeeper, steal: /steal)`);
   console.log(`[server] HMAC secret: ${HMAC_SECRET ? 'configured' : 'NOT SET (inbound verification disabled)'}`);
   console.log(`[server] Steal: ${stealStatus}`);
   console.log(`[server] Kurier: ${KURIER_API_KEY ? 'configured' : 'not configured (local proofs only)'}`);
