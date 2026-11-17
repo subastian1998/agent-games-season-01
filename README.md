@@ -82,6 +82,16 @@ Response (signed with `x-agent-games-signature` over the raw body):
 reliability bonus). Preflight (`{"type":"agent-games.preflight.v1"}`) is
 answered `{ok:true, protocolVersion:"v1"}`, signed.
 
+**v2 upgrade (2026-11-18, `UPGRADE-v2-REPORT.md`):** the proof_tx seen-set is
+now persistent (JSONL file + fsync, survives restarts; point
+`GATEKEEPER_SEEN_FILE` at a Railway Volume so it also survives redeploys);
+proof generation has a 30s watchdog (decision-only on timeout, never a hang);
+malformed numeric fields fail closed as `REJECT/INVALID_TASK` instead of a
+500; inbound bodies over 1 MB get 413; every decision is logged as one JSON
+line (`task_id`, `reason_code`, proof time — never secrets); `/health`
+reports `seenProofTx` + `seenPersisted`. Decision semantics are unchanged —
+the 7-trap checklist is exactly the same as the circuit.
+
 Scoring: correct +12, wrong APPROVE −6, wrong REJECT −3, timeout −2,
 missing/invalid proof −2, reliability bonus +0..+5. Rounds: 8 daily rounds,
 13–21 Nov, 17:30–03:30 WIB, 8 tasks/agent/round. Proof generation ~0.4s,

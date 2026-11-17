@@ -1,6 +1,8 @@
 # Secrets and local state — never commit.
 .env
 kurier-vk.json
+# Gatekeeper runtime state (persistent proof_tx seen-set) — never commit.
+gatekeeper/seen-proof-tx.jsonl
 *.log
 
 # Dependencies (installed via shared/npm/install.js — npm is broken in this VM).

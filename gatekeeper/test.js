@@ -4,6 +4,10 @@
 // verifies it locally. A case passes only if (a) decide() returns the
 // expected decision/reason_code AND (b) the circuit accepts the proof.
 // Run:  node gatekeeper/test.js
+// v2: run the harness with persistence OFF so test proof_txs never touch
+// the real seen-set file (restart persistence is covered by
+// gatekeeper/test-restart.js). Must be set BEFORE requiring decide.
+process.env.GATEKEEPER_SEEN_PERSIST = '0';
 const { decide, resetSeen } = require('./decide');
 const { proveTask } = require('./prove');
 const { verifyLocally } = require('../shared/snark');

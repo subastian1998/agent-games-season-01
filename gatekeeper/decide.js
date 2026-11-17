@@ -19,13 +19,24 @@
 //   - amount == max_transfer is VALID (max is inclusive).
 //   - proof_tx reuse is tracked per task_id: a platform retry of the SAME
 //     task_id is not a reuse; the same proof_tx under another task_id is.
-const seenProofTx = new Map(); // proof_tx (lowercased) -> task_id
+//
+// v2: the seen-set is persistent (gatekeeper/seenStore.js) instead of an
+// in-memory Map — v1 lost it on every restart, so a PROOF_REUSED trap
+// after a restart was missed (wrong APPROVE = -6 instead of +12).
+// The check ORDER and the record point are unchanged: a proof_tx is
+// recorded on first sight, AFTER the VK check passes and BEFORE the
+// threshold/expiry/recipient/amount checks — exactly like v1.
+// decide(input, store): store is optional, defaults to the process-wide
+// persistent store. Tests pass their own store (or run with
+// GATEKEEPER_SEEN_PERSIST=0) so test proof_txs never touch the real file.
+const { getDefaultStore } = require('./seenStore');
 
 function normalizeAddress(a) {
   return String(a || '').toLowerCase();
 }
 
-function decide(input) {
+function decide(input, store) {
+  const seen = store || getDefaultStore();
   const registeredVk = String(input.registered_vk || '').toLowerCase();
   const proofVk = String(input.proof_vk || '').toLowerCase();
   const minimum = BigInt(input.minimum);
@@ -42,11 +53,11 @@ function decide(input) {
   if (proofVk !== registeredVk) return { decision: 'REJECT', reason_code: 'VK_SUBSTITUTION' };
 
   if (proofTx) {
-    const prevTask = seenProofTx.get(proofTx);
+    const prevTask = seen.get(proofTx);
     if (prevTask !== undefined && prevTask !== taskId) {
       return { decision: 'REJECT', reason_code: 'PROOF_REUSED' };
     }
-    if (prevTask === undefined) seenProofTx.set(proofTx, taskId);
+    if (prevTask === undefined) seen.record(proofTx, taskId);
   }
 
   if (publicBalance < minimum) return { decision: 'REJECT', reason_code: 'THRESHOLD_MISMATCH' };
@@ -60,7 +71,7 @@ function decide(input) {
 }
 
 function resetSeen() {
-  seenProofTx.clear();
+  getDefaultStore().clear();
 }
 
-module.exports = { decide, resetSeen, seenProofTx };
+module.exports = { decide, resetSeen, getSeenStore: getDefaultStore };

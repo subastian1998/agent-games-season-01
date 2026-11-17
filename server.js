@@ -33,6 +33,7 @@ const { verifySignature, signatureFor } = require('./shared/hmac');
 const { verifyLocally } = require('./shared/snark');
 const { submitProof } = require('./shared/kurier');
 const { decide } = require('./gatekeeper/decide');
+const { getDefaultStore, createSeenStore } = require('./gatekeeper/seenStore');
 const { proveTask } = require('./gatekeeper/prove');
 const { policy, validateParams } = require('./steal/policy');
 const { proveTurn, strategyCommitment } = require('./steal/prove');
@@ -44,6 +45,17 @@ const HMAC_SECRET = process.env.AGENT_GAMES_HMAC_SECRET || '';
 const HMAC_FORMAT = process.env.AGENT_GAMES_HMAC_FORMAT || 'hex'; // or 'sha256='
 const KURIER_API_KEY = process.env.KURIER_API_KEY || '';
 const TASK_ID_MODE = process.env.GATEKEEPER_TASK_ID_MODE || 'keccak';
+// v2: proof-generation watchdog — a hung proof must answer (decision-only)
+// instead of never responding. Proofs normally take ~0.4s; 30s is 75x
+// headroom and still inside the platform's 60s deadline.
+const PROVE_TIMEOUT_MS = Number(process.env.GATEKEEPER_PROVE_TIMEOUT_MS || 30000);
+// v2: inbound body cap — a huge body must be rejected, never OOM the server.
+const MAX_BODY_BYTES = Number(process.env.MAX_BODY_BYTES || 1000000);
+
+// v2: load the persistent proof_tx seen-set eagerly at startup so a
+// corrupt/missing file is visible immediately, not on the first request.
+const seenStore = getDefaultStore();
+console.log(`[server] gatekeeper seen-set: ${seenStore.size()} proof_tx from ${seenStore.file} (persist ${seenStore.persist ? 'on' : 'off'})`);
 
 // ---- Steal configuration (env) ----
 // STRATEGY_PARAMS: comma-separated 8 numbers, e.g. "5,50,0,0,0,0,0,0".
@@ -95,10 +107,59 @@ function sendJson(res, status, obj, sign) {
 function readBody(req) {
   return new Promise((resolve, reject) => {
     const chunks = [];
-    req.on('data', (c) => chunks.push(c));
-    req.on('end', () => resolve(Buffer.concat(chunks)));
+    let total = 0;
+    let failed = false;
+    req.on('data', (c) => {
+      if (failed) return; // keep draining (discarded) so the 413 can be sent
+      total += c.length;
+      if (total > MAX_BODY_BYTES) {
+        failed = true;
+        chunks.length = 0;
+        const err = new Error('request body too large');
+        err.code = 'BODY_TOO_LARGE';
+        // Do NOT destroy the socket: the client would never receive the
+        // 413 (destroy aborts the response). Drain the rest instead.
+        req.resume();
+        req.once('end', () => reject(err));
+        return;
+      }
+      chunks.push(c);
+    });
+    req.on('end', () => { if (!failed) resolve(Buffer.concat(chunks)); });
     req.on('error', reject);
   });
+}
+
+// v2: race a promise against a timeout. snarkjs cannot be cancelled, so a
+// timed-out proof keeps running in the background; its result is discarded
+// and any late rejection is swallowed so it can never surface as unhandled.
+function withTimeout(promise, ms) {
+  let timer;
+  const timeout = new Promise((_, reject) => {
+    timer = setTimeout(() => {
+      const err = new Error(`proof generation timed out after ${ms}ms`);
+      err.code = 'PROVE_TIMEOUT';
+      reject(err);
+    }, ms);
+  });
+  const guarded = promise.then(
+    (v) => { clearTimeout(timer); return v; },
+    (e) => { clearTimeout(timer); throw e; }
+  );
+  guarded.catch(() => {});
+  return Promise.race([guarded, timeout]);
+}
+
+// v2: one structured JSON line per Gatekeeper decision. Never logs secrets:
+// no HMAC, no salt, no proof content — only public task identifiers.
+// Fields: ts, track, task_id, decision, reason_code, proof_tx, proof_ms,
+// proof = ok | timeout | error | none (none = PROOF_REUSED / INVALID_TASK).
+function logDecision(task, decision, reason_code, proof, proofMs) {
+  console.log(JSON.stringify({
+    ts: new Date().toISOString(), track: 'gatekeeper',
+    task_id: String(task.task_id || ''), decision, reason_code,
+    proof_tx: String(task.proof_tx || ''), proof_ms: proofMs, proof,
+  }));
 }
 
 function verifyInbound(rawBody, req) {
@@ -117,29 +178,50 @@ function isPreflight(obj) {
 // ---- Gatekeeper handler ----
 async function handleGatekeeper(obj) {
   const task = obj.input || obj;
+  const t0 = Date.now();
   const required = ['registered_vk', 'proof_vk', 'minimum', 'public_balance', 'expiry_block', 'current_block', 'recipient', 'condition_recipient', 'amount', 'max_transfer'];
   for (const f of required) {
     if (task[f] === undefined || task[f] === null || task[f] === '') {
+      logDecision(task, 'REJECT', 'INVALID_TASK', 'none', Date.now() - t0);
       return { status: 200, body: { decision: 'REJECT', reason_code: 'INVALID_TASK', proof_tx: String(task.proof_tx || '') } };
     }
   }
-  const { decision, reason_code } = decide(task);
+  // v2: decide() throws on malformed numerics (e.g. amount "12.5" — BigInt
+  // rejects it). That must fail closed with a decision, not a 500: a 500
+  // scores as a timeout (-2) and leaves the platform without an answer.
+  let decision;
+  let reason_code;
+  try {
+    ({ decision, reason_code } = decide(task));
+  } catch (e) {
+    console.error('[gatekeeper] decide() threw on malformed task:', e.message);
+    logDecision(task, 'REJECT', 'INVALID_TASK', 'none', Date.now() - t0);
+    return { status: 200, body: { decision: 'REJECT', reason_code: 'INVALID_TASK', proof_tx: String(task.proof_tx || '') } };
+  }
   const proofTx = String(task.proof_tx || '');
   if (reason_code === 'PROOF_REUSED') {
     // No proof to submit for a reused proof (platform excludes these from
     // the reliability bonus).
+    logDecision(task, decision, reason_code, 'none', Date.now() - t0);
     return { status: 200, body: { decision, reason_code, proof_tx: proofTx } };
   }
   try {
-    const { proof, publicSignals } = await proveTask(task, decision, TASK_ID_MODE);
+    // v2: watchdog — a hung proof answers decision-only instead of hanging
+    // past the platform's 60s deadline (same -2 as a timeout, but fast,
+    // and the platform may retry the same task_id for a valid proof).
+    const { proof, publicSignals } = await withTimeout(proveTask(task, decision, TASK_ID_MODE), PROVE_TIMEOUT_MS);
+    const proofMs = Date.now() - t0;
     // Kurier (best-effort, background): on-chain finalization pointer.
     // Gatekeeper responses carry no proofReference field, so this is fire-and-forget.
     if (KURIER_API_KEY) {
       submitProof(KURIER_API_KEY, 'gatekeeper', proof, publicSignals, 15000).catch(() => {});
     }
+    logDecision(task, decision, reason_code, 'ok', proofMs);
     return { status: 200, body: { decision, reason_code, proof_tx: proofTx, proof, public_signals: publicSignals } };
   } catch (e) {
-    console.error('[gatekeeper] proof generation failed (decision still returned):', e.message);
+    const proofStatus = e && e.code === 'PROVE_TIMEOUT' ? 'timeout' : 'error';
+    console.error(`[gatekeeper] proof generation ${proofStatus} (decision still returned):`, e.message);
+    logDecision(task, decision, reason_code, proofStatus, Date.now() - t0);
     return { status: 200, body: { decision, reason_code, proof_tx: proofTx } };
   }
 }
@@ -217,7 +299,11 @@ async function selfTests() {
       condition_recipient: '0x1111111111111111111111111111111111111111',
       amount: '500', max_transfer: '1000', proof_tx: '0xselftest',
     };
-    const { decision } = decide(task);
+    // v2: the self-test task uses proof_tx '0xselftest' — run it against a
+    // transient (non-persistent) store so the marker never pollutes the
+    // real seen-set file.
+    const selfTestStore = createSeenStore({ persist: false });
+    const { decision } = decide(task, selfTestStore);
     const { proof, publicSignals } = await proveTask(task, decision, TASK_ID_MODE);
     const ok = await verifyLocally('gatekeeper', publicSignals, proof);
     gatekeeperSelfTest = ok && decision === 'APPROVE' ? 'PASS (APPROVE proof verifies locally)' : 'FAIL';
@@ -247,7 +333,7 @@ const server = http.createServer(async (req, res) => {
     if (req.method === 'GET' && req.url === '/health') {
       return sendJson(res, 200, {
         ok: true,
-        gatekeeper: { hmacConfigured: !!HMAC_SECRET, taskIdMode: TASK_ID_MODE, selfTest: gatekeeperSelfTest },
+        gatekeeper: { hmacConfigured: !!HMAC_SECRET, taskIdMode: TASK_ID_MODE, selfTest: gatekeeperSelfTest, seenProofTx: seenStore.size(), seenPersisted: seenStore.persist },
         steal: { status: stealStatus, selfTest: stealSelfTest, kurierConfigured: !!KURIER_API_KEY },
         uptimeSec: Math.floor(process.uptime()),
       });
@@ -258,7 +344,13 @@ const server = http.createServer(async (req, res) => {
     if (req.method !== 'POST' || (req.url !== '/gatekeeper' && req.url !== '/steal')) {
       return sendJson(res, 404, { error: 'not found' });
     }
-    const rawBody = await readBody(req);
+    let rawBody;
+    try {
+      rawBody = await readBody(req);
+    } catch (e) {
+      if (e && e.code === 'BODY_TOO_LARGE') return sendJson(res, 413, { error: 'body too large' });
+      throw e;
+    }
     if (!verifyInbound(rawBody, req)) {
       console.warn('[warn] HMAC mismatch on', req.url);
       return sendJson(res, 401, { error: 'bad signature' });
